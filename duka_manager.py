@@ -15,8 +15,8 @@ Includes:
   • FastAPI: webhook (Twilio-validated), M-Pesa callback, protected cron endpoints
 """
 
-import os, re, json, asyncio, logging, base64, io, uuid, textwrap
-from collections import defaultdict
+import os, re, json, asyncio, logging, base64, io, uuid, textwrap, hashlib
+from collections import defaultdict, counter 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional
@@ -57,9 +57,9 @@ log = logging.getLogger(__name__)
 class Config:
     supabase_url:          str = os.getenv("SUPABASE_URL", "")
     supabase_key:          str = os.getenv("SUPABASE_KEY", "")
-    twilio_account_sid:    str = os.getenv("TWILIO_ACCOUNT_SID", "")
-    twilio_auth_token:     str = os.getenv("TWILIO_AUTH_TOKEN", "")
-    twilio_whatsapp_number:str = os.getenv("TWILIO_WHATSAPP_NUMBER", "")
+    story_score_threshold:    float = float(os.getenv("STORY_SCORE_THRESHOLD", "7.0"))
+    channel_link:     str = os.getenv("CHANNEL_LINK", "")
+    channel_live: bool = os.getenv("CHANNEL_LIVE", "false").lower==true
     openai_api_key:        str = os.getenv("OPENAI_API_KEY", "")
     mpesa_consumer_key:    str = os.getenv("MPESA_CONSUMER_KEY", "")
     mpesa_consumer_secret: str = os.getenv("MPESA_CONSUMER_SECRET", "")
@@ -68,6 +68,10 @@ class Config:
     mpesa_callback_url:    str = os.getenv("MPESA_CALLBACK_URL", "")
     cron_secret:           str = os.getenv("CRON_SECRET", "change_this_in_production")
     data_sources:          List[str] = None
+    meta_access_token:     str = os.getenv("META_ACCESS_TOKEN", "")
+    meta_phone_number_id:  str = os.getenv("META_PHONE_NUMBER_ID", "")
+    Whatsapp_channel_id:   str = os.getenv("WHATSAPP_CHANNEL_ID", "")
+    data_sources:     List[str] = None
 
     def __post_init__(self):
         raw = os.getenv("DATA_SOURCES", "")
@@ -832,59 +836,482 @@ _image_builder = BalanceBookImageBuilder()
 # ══════════════════════════════════════════════
 # ADVICE ENGINE  (Swahili + English mix)
 # ══════════════════════════════════════════════
-class AdviceEngine:
-    PRAISE = [
-        "🎉 Hongera! Margin yako ni nzuri — endelea kuwekeza vizuri.",
-        "💪 Biashara inakua! Mauzo yako ni mazuri — sasa ni wakati wa kuvutia wateja waaminifu.",
-        "🌟 Kazi nzuri! Mapato mazuri. Weka akiba ya dharura ya angalau 10% ya faida.",
-        "🏆 Poa sana! Deni lako liko chini — msingi imara wa biashara.",
-        "🚀 Biashara ni nzuri! Fikiria kuongeza aina mpya ya bidhaa.",
+class SmartAdviceEngine:
+    """
+    Gamified crowdsourcing + LLM story scoring + WhatsApp Channel queue.
+
+    Supabase tables required:
+      crowd_profiles  (shop_id PK, location, shop_type, revenue, customers,
+                       challenge, points, streak, last_share, submissions, reputation)
+      crowd_tips      (id PK, shop_id, tip, location, shop_type,
+                       upvotes, downvotes, reactions, score, featured, channel_posted,
+                       created_at)
+      channel_queue   (id PK, tip_id, story_text, score, status, created_at)
+                       status: pending | posted | rejected
+    """
+
+    _COMMANDS = [
+        (["/share", "/s"],      "_cmd_share"),
+        (["/tip", "/t"],        "_cmd_tip"),
+        (["/feature", "/post"], "_cmd_feature"),
+        (["/verify", "/v"],     "_cmd_verify"),
+        (["/upvote"],           "_cmd_upvote"),
+        (["/downvote"],         "_cmd_downvote"),
+        (["/benchmark", "/b"],  "_cmd_benchmark"),
+        (["/profile", "/my"],   "_cmd_profile"),
+        (["/crowdhelp", "/ch"], "_cmd_help"),
     ]
 
-    def generate(self, metrics: Dict, insights: List[Dict],
-                 market: Dict, low_stock: List[str]) -> List[str]:
-        msgs, seen = [], set()
+    def match_command(self, message: str) -> Optional[tuple]:
+        msg = message.lower().strip()
+        for prefixes, handler in self._COMMANDS:
+            for p in prefixes:
+                if msg == p or msg.startswith(p + " "):
+                    return handler, message.strip()
+        return None
 
-        def add(m):
-            k = m[:40]
-            if k not in seen:
-                seen.add(k); msgs.append(m)
+    async def _cmd_share(self, phone: str, message: str) -> str:
+        body = re.sub(r"^/s(?:hare)?\s*", "", message, flags=re.IGNORECASE).strip()
+        data = {}
+        for pair in re.findall(r"(\w+)=([^|]+)", body):
+            data[pair[0].strip().lower()] = pair[1].strip()
+        if not data.get("revenue"):
+            nums = re.findall(r"\d{3,}", body)
+            if nums:
+                data["revenue"] = nums[0]
 
-        margin  = metrics.get("profit_margin", 0)
-        revenue = metrics.get("revenue", 1) or 1
-        debt    = metrics.get("total_debt", 0)
+        if not data:
+            return (
+                "❌ Mfano:\n"
+                "/share mapato=12000|wateja=35|mahali=Nairobi Eastlands"
+                "|aina=butchery|changamoto=bei ya nyama juu\n\n"
+                "Sehemu: mapato, wateja, mahali, aina, changamoto"
+            )
 
-        if margin >= 25:
-            import random
-            add(random.choice(self.PRAISE))
-        elif margin < 15:
-            add(f"📉 Margin ni {margin:.1f}% — chini sana. Angalia bei au punguza gharama.")
+        existing = await db.execute("crowd_profiles", "select", eq={"shop_id": phone})
+        prev = existing.data[0] if existing.data else {}
 
-        if debt / revenue > 0.3:
-            add(f"⚠️ Deni ni {debt/revenue*100:.0f}% ya mapato. Fuatilia madeni yako haraka.")
+        location  = data.get("mahali",    prev.get("location",  "unknown"))
+        shop_type = data.get("aina",      prev.get("shop_type", "duka"))
+        revenue   = self._to_float(data.get("mapato",    prev.get("revenue")))
+        customers = self._to_float(data.get("wateja",    prev.get("customers")))
+        challenge = data.get("changamoto", prev.get("challenge"))
 
-        for ins in insights:
-            if ins.get("type") == "decline":
-                m = re.search(r"([\d.]+)%", ins.get("description",""))
-                pct = m.group(1) if m else "?"
-                add(f"📉 Mauzo yameshuka {pct}% — angalia washindani au pata maoni ya wateja.")
-            elif ins.get("type") == "excess_stock":
-                add("📦 Bidhaa nyingine zimekaa sana ghalani — fanya promotion ili uziuze.")
+        last_share = prev.get("last_share")
+        streak = prev.get("streak", 0)
+        if last_share:
+            days_since = (datetime.now() - dateparser.parse(last_share)).days
+            streak = (streak + 1) if days_since == 1 else (1 if days_since > 1 else streak)
+        else:
+            streak = 1
 
-        if low_stock:
-            add(f"🔴 Stock ya {', '.join(low_stock[:3])} iko chini — agiza haraka.")
+        points      = prev.get("points", 0) + 30
+        submissions = prev.get("submissions", 0) + 1
 
-        for comp in (market.get("comparisons") or [])[:3]:
-            pct  = comp.get("percentage_diff", 0)
-            prod = comp.get("product","")
-            if pct > 12:
-                add(f"💡 {prod}: Bei yako ni {abs(pct):.0f}% juu ya soko — punguza kidogo ili ushinde washindani.")
-            elif pct < -12:
-                add(f"💡 {prod}: Bei yako ni {abs(pct):.0f}% chini ya soko — unaweza panda bei na uongeze faida.")
+        row = {
+            "shop_id":     phone,
+            "location":    location,
+            "shop_type":   shop_type,
+            "revenue":     revenue,
+            "customers":   customers,
+            "challenge":   challenge,
+            "points":      points,
+            "streak":      streak,
+            "last_share":  datetime.now().isoformat(),
+            "submissions": submissions,
+            "reputation":  prev.get("reputation", 1.0),
+        }
 
-        return msgs[:5]
+        if existing.data:
+            await db.execute("crowd_profiles", "update",
+                data=row, match={"key": "shop_id", "value": phone})
+        else:
+            await db.execute("crowd_profiles", "insert", data=row)
 
-_advice_engine = AdviceEngine()
+        await db.execute("shops", "update",
+            data={"location": location, "shop_type": shop_type},
+            match={"key": "id", "value": phone})
+
+        avg_rev = await self._avg_metric("revenue", location)
+        top_ch  = await self._top_challenge(location)
+
+        return (
+            f"✅ Asante! Data imehifadhiwa bila jina.\n\n"
+            f"⭐ Pointi zako: {points}  🔥 Streak: {streak} siku\n\n"
+            f"📊 Wastani wa eneo lako ({location}):\n"
+            f"  💰 Mapato: KES {avg_rev:,.0f}\n"
+            f"  ⚠️  Changamoto: {top_ch}\n\n"
+            f"Tuma /tip [hadithi yako] kushiriki uzoefu wako!\n"
+            f"Au /benchmark kuona jinsi unavyolinganisha."
+        )
+
+    async def _cmd_tip(self, phone: str, message: str) -> str:
+        tip_text = re.sub(r"^/t(?:ip)?\s*", "", message, flags=re.IGNORECASE).strip()
+
+        if len(tip_text) < 15:
+            return (
+                "Toa uzoefu mrefu zaidi (angalau herufi 15).\n"
+                "Mfano: /tip Niliongeza packaging safi kwa ofisi → mauzo +25%"
+            )
+
+        profile = await db.execute("crowd_profiles", "select", eq={"shop_id": phone})
+        prof = profile.data[0] if profile.data else {}
+
+        tip_id = hashlib.md5(f"{phone}{tip_text}{datetime.now().isoformat()}".encode()).hexdigest()[:10]
+
+        await db.execute("crowd_tips", "insert", data={
+            "id":             tip_id,
+            "shop_id":        phone,
+            "tip":            tip_text,
+            "location":       prof.get("location", "unknown"),
+            "shop_type":      prof.get("shop_type", "duka"),
+            "upvotes":        0,
+            "reactions":      0,
+            "score":          0.0,
+            "featured":       False,
+            "channel_posted": False,
+            "created_at":     datetime.now().isoformat(),
+        })
+
+        new_points = prof.get("points", 0) + 50
+        if profile.data:
+            await db.execute("crowd_profiles", "update",
+                data={"points": new_points},
+                match={"key": "shop_id", "value": phone})
+
+        asyncio.create_task(self._score_and_queue(tip_id, tip_text, prof))
+
+        return (
+            f"🙏 Tip imepokewa! ID: *{tip_id}*\n\n"
+            f"⭐ Pointi zako: {new_points}\n\n"
+            f"Bot itaangalia kama hadithi yako inafaa kushirikiwa\n"
+            f"na jamii kwenye Channel. Utajulishwa!\n\n"
+            f"Tuma /feature {tip_id} kama unataka kushirikiwa mapema."
+        )
+
+    async def _cmd_feature(self, phone: str, message: str) -> str:
+        parts = message.split()
+        if len(parts) < 2:
+            return "Tumia: /feature <tip_id>"
+
+        tip_id = parts[1]
+        tips = await db.execute("crowd_tips", "select", eq={"id": tip_id})
+        if not tips.data:
+            return "❌ Tip haikupatikana."
+        if tips.data[0]["shop_id"] != phone:
+            return "❌ Hii si tip yako."
+        if tips.data[0].get("channel_posted"):
+            return "✅ Tip hii tayari imechapishwa kwenye Channel!"
+
+        profile = await db.execute("crowd_profiles", "select", eq={"shop_id": phone})
+        prof = profile.data[0] if profile.data else {}
+        asyncio.create_task(self._score_and_queue(tip_id, tips.data[0]["tip"], prof, force=True))
+
+        new_pts = prof.get("points", 0) + 100
+        if profile.data:
+            await db.execute("crowd_profiles", "update",
+                data={"points": new_pts},
+                match={"key":"shop_id", "value": phone})
+
+        return (
+            f"🎉 Ombi lako limepokewa!\n\n"
+            f"Bot itaangalia ubora wa hadithi yako na kuichapisha\n"
+            f"kwenye Channel ikipita kiwango.\n\n"
+            f"⭐ Pointi zako: {new_pts}\n"
+            f"📢 Channel: {config.channel_link}"
+        )
+
+    async def _score_and_queue(self, tip_id: str, tip_text: str, prof: Dict, force: bool = False):
+        try:
+            client = AsyncOpenAI(api_key=config.openai_api_key)
+            scoring_prompt = f"""
+You are evaluating a story/tip from a Kenyan small business owner (duka, butchery, or shop).
+Score it on these 4 axes, each from 1 to 10:
+
+1. SPECIFICITY — has real numbers, named products, before/after, specific location
+2. ACTIONABILITY — another shopkeeper can immediately replicate this
+3. LOCAL_RELEVANCE — references Kenyan realities: M-Pesa, boda bodas, inflation, specific towns, local products
+4. GROWTH_SIGNAL — promotes business growth OR warns about a real cautionary risk (both qualify equally)
+
+Story: "{tip_text}"
+Location: {prof.get("location", "unknown")}
+Shop type: {prof.get("shop_type", "duka")}
+
+Respond ONLY with valid JSON, no extra text:
+{{"specificity": 0, "actionability": 0, "local_relevance": 0, "growth_signal": 0, "reason": "short reason"}}
+"""
+            resp = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": scoring_prompt}],
+                temperature=0.1,
+                max_tokens=150,
+            )
+            raw = resp.choices[0].message.content.strip()
+            scores = json.loads(raw)
+
+            axes = ["specificity", "actionability", "local_relevance", "growth_signal"]
+            avg_score = sum(scores.get(a, 0) for a in axes) / 4
+
+            await db.execute("crowd_tips", "update",
+                data={"score": round(avg_score, 2)},
+                match={"key": "id", "value": tip_id})
+
+            log.info(f"Tip {tip_id} scored {avg_score:.1f}/10 — {scores.get('reason', '')}")
+
+            if avg_score >= config.story_score_threshold or force:
+                await self._queue_for_channel(tip_id, tip_text, avg_score, prof)
+
+        except Exception as e:
+            log.error(f"Scoring failed for tip {tip_id}: {e}")
+
+    async def _queue_for_channel(self, tip_id: str, tip_text: str, score: float, prof: Dict):
+        story = self._format_channel_story(tip_text, prof, score)
+
+        await db.execute("channel_queue", "insert", data={
+            "id":         str(uuid.uuid4()),
+            "tip_id":     tip_id,
+            "story_text": story,
+            "score":      round(score, 2),
+            "status":     "pending",
+            "created_at": datetime.now().isoformat(),
+        })
+
+        await db.execute("crowd_tips", "update",
+            data={"featured": True},
+            match={"key": "id", "value": tip_id})
+
+        if config.channel_live:
+            await self._post_to_channel(story, tip_id)
+        else:
+            log.info(f"Tip {tip_id} queued (CHANNEL_LIVE=false). Score: {score:.1f}")
+
+        tips_r = await db.execute("crowd_tips", "select", eq={"id": tip_id})
+        if tips_r.data:
+            owner_phone = tips_r.data[0].get("shop_id", "")
+            if owner_phone:
+                await self._notify_owner(owner_phone, tip_id, score)
+
+    def _format_channel_story(self, tip_text: str, prof: Dict, score: float) -> str:
+        location  = prof.get("location", "Kenya")
+        shop_type = prof.get("shop_type", "Duka")
+        return (
+            f"💡 *HADITHI YA BIASHARA — {shop_type.upper()} | {location.upper()}*\n\n"
+            f"{tip_text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Imepigwa kura na wafanyabiashara wenzako\n"
+            f"🤝 Jiunge: {config.channel_link}\n"
+            f"💬 Shiriki uzoefu wako → DM Smart Duka Bot"
+        )
+
+    async def _post_to_channel(self, story_text: str, tip_id: str):
+        url = f"https://graph.facebook.com/v19.0/{config.meta_phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to":                config.whatsapp_channel_id,
+            "type":              "text",
+            "text":              {"body": story_text},
+        }
+        headers = {
+            "Authorization": f"Bearer {config.meta_access_token}",
+            "Content-Type":  "application/json",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers,
+                                        timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    result = await r.json()
+                    if r.status == 200:
+                        await db.execute("crowd_tips", "update",
+                            data={"channel_posted": True},
+                            match={"key": "id", "value": tip_id})
+                        await db.execute("channel_queue", "update",
+                            data={"status": "posted"},
+                            match={"key": "tip_id", "value": tip_id})
+                        log.info(f"Tip {tip_id} posted to channel ✅")
+                    else:
+                        log.error(f"Meta API error for tip {tip_id}: {result}")
+        except Exception as e:
+            log.error(f"Channel post failed for tip {tip_id}: {e}")
+
+    async def _notify_owner(self, phone: str, tip_id: str, score: float):
+        prof_r = await db.execute("crowd_profiles", "select", eq={"shop_id": phone})
+        pts = prof_r.data[0].get("points", 0) if prof_r.data else 0
+        msg = (
+            f"🎉 *Hongera!* Hadithi yako imepita kiwango!\n\n"
+            f"ID: {tip_id}  |  Score: {score:.1f}/10\n"
+            f"⭐ Pointi zako: {pts}\n\n"
+            + (f"✅ Imechapishwa kwenye Channel!\n📢 {config.channel_link}"
+               if config.channel_live else
+               "⏳ Itachapishwa Channel hivi karibuni.")
+        )
+        try:
+            loop = asyncio.get_event_loop()
+            twilio_client = TwilioClient(config.twilio_account_sid, config.twilio_auth_token)
+            await loop.run_in_executor(
+                None,
+                lambda: twilio_client.messages.create(
+                    body=msg,
+                    from_=config.twilio_whatsapp_number,
+                    to=f"whatsapp:{phone}",
+                )
+            )
+        except Exception as e:
+            log.error(f"Owner notify failed for {phone}: {e}")
+
+    async def _cmd_verify(self, phone: str, message: str) -> str:
+        parts = message.split()
+        if len(parts) < 2:
+            return "Tumia: /verify <tip_id>"
+        tip_id = parts[1]
+        tips = await db.execute("crowd_tips", "select", eq={"id": tip_id})
+        if not tips.data:
+            return "❌ Tip haikupatikana."
+        t = tips.data[0]
+        status = (
+            "✅ Imechapishwa kwenye Channel" if t.get("channel_posted") else
+            "⏳ Inasubiri Channel"            if t.get("featured")       else
+            "🔍 Bado haijapimwa"
+        )
+        return (
+            f"🔍 *Thibitisha Tip:*\n\n"
+            f"📝 \"{t['tip']}\"\n\n"
+            f"📍 {t['location']}  |  🏪 {t['shop_type']}\n"
+            f"👍 {t['upvotes']}  |  ❤️ {t['reactions']}  |  📊 Score: {t.get('score', 0):.1f}/10\n"
+            f"📢 {status}\n\n"
+            f"Je, inakusaidia?\n"
+            f"/upvote {tip_id}  au  /downvote {tip_id}"
+        )
+
+    async def _cmd_upvote(self, phone: str, message: str) -> str:
+        return await self._vote(message, "upvotes")
+
+    async def _cmd_downvote(self, phone: str, message: str) -> str:
+        return await self._vote(message, "downvotes")
+
+    async def _vote(self, message: str, field: str) -> str:
+        parts = message.split()
+        if len(parts) < 2:
+            return f"Tumia: /{field.rstrip('s')} <tip_id>"
+        tip_id = parts[1]
+        tips = await db.execute("crowd_tips", "select", eq={"id": tip_id})
+        if not tips.data:
+            return "❌ Tip haikupatikana."
+        new_val = tips.data[0].get(field, 0) + 1
+        await db.execute("crowd_tips", "update",
+            data={field: new_val}, match={"key": "id", "value": tip_id})
+        icon = "👍" if field == "upvotes" else "👎"
+        return f"✅ Kura imehesabiwa! {icon} {new_val}"
+
+    async def _cmd_benchmark(self, phone: str, message: str) -> str:
+        prof_r = await db.execute("crowd_profiles", "select", eq={"shop_id": phone})
+        if not prof_r.data:
+            return "📊 Shiriki data kwanza:\n/share mapato=5000|wateja=45|mahali=Nairobi"
+
+        me        = prof_r.data[0]
+        location  = me.get("location", "unknown")
+        shop_type = me.get("shop_type", "duka")
+        my_rev    = me.get("revenue")   or 0
+        my_cust   = me.get("customers") or 0
+
+        avg_rev  = await self._avg_metric("revenue",   location)
+        avg_cust = await self._avg_metric("customers", location)
+        count    = await self._peer_count(location)
+        top_ch   = await self._top_challenge(location)
+
+        return (
+            f"📊 *Benchmark — {shop_type} | {location}*\n"
+            f"_(Biashara {count} sawa nawe)_\n\n"
+            f"💰 Mapato:  Wewe KES {my_rev:,.0f}  |  Wastani KES {avg_rev:,.0f}  {self._diff_label(my_rev, avg_rev)}\n"
+            f"👥 Wateja:  Wewe {my_cust:.0f}  |  Wastani {avg_cust:.0f}  {self._diff_label(my_cust, avg_cust)}\n"
+            f"⚠️  Changamoto kubwa: {top_ch}\n\n"
+            f"Tuma /tip [uzoefu wako] kusaidia wenzako!"
+        )
+
+    async def _cmd_profile(self, phone: str, message: str) -> str:
+        prof_r = await db.execute("crowd_profiles", "select", eq={"shop_id": phone})
+        if not prof_r.data:
+            return "Bado huna data. Tuma /share kuanza!"
+        me = prof_r.data[0]
+        tips_r = await db.execute("crowd_tips", "select", eq={"shop_id": phone})
+        posted = sum(1 for t in tips_r.data if t.get("channel_posted"))
+        return (
+            f"👤 *Profaili Yako*\n\n"
+            f"📍 {me.get('location', '?')}  |  🏪 {me.get('shop_type', '?')}\n"
+            f"⭐ Pointi: {me.get('points', 0)}\n"
+            f"🔥 Streak: {me.get('streak', 0)} siku\n"
+            f"📤 Tips ulizotuma: {len(tips_r.data)}\n"
+            f"📢 Zilizochapishwa Channel: {posted}\n\n"
+            f"Tuma /tip kushiriki hadithi yako!"
+        )
+
+    async def _cmd_help(self, phone: str, message: str) -> str:
+        return (
+            f"🤝 *Smart Duka — Crowdsourcing*\n\n"
+            f"📊 /share mapato=5000|wateja=45|mahali=Meru|aina=butchery\n"
+            f"   _Shiriki takwimu zako (bila jina)_\n\n"
+            f"💡 /tip [hadithi/uzoefu wako]\n"
+            f"   _Bot itapima ubora na kuchapisha Channel_\n\n"
+            f"🌟 /feature <tip_id> — omba kuchapishwa haraka\n"
+            f"🔍 /verify <tip_id>  — angalia tip ya mtu\n"
+            f"👍 /upvote <tip_id>  au  /downvote <tip_id>\n"
+            f"📈 /benchmark        — linganisha na wenzako\n"
+            f"👤 /profile          — pointi na streak yako\n\n"
+            f"📢 Channel: {config.channel_link}\n"
+            f"_Data yote huhifadhiwa bila jina. Bure kabisa._"
+        )
+
+    async def get_top_tips(self, location: str, shop_type: str, limit: int = 3) -> List[str]:
+        rows = await db.execute("crowd_tips", "select", eq={"location": location})
+        if not rows.data:
+            rows = await db.execute("crowd_tips", "select", eq={"shop_type": shop_type})
+        sorted_tips = sorted(
+            rows.data,
+            key=lambda t: (t.get("score", 0) * 0.5 + t.get("reactions", 0) * 0.3 + t.get("upvotes", 0) * 0.2),
+            reverse=True,
+        )
+        return [t["tip"] for t in sorted_tips[:limit]]
+
+    async def flush_channel_queue(self) -> int:
+        queue = await db.execute("channel_queue", "select", eq={"status": "pending"})
+        posted = 0
+        for item in queue.data:
+            await self._post_to_channel(item["story_text"], item["tip_id"])
+            posted += 1
+            await asyncio.sleep(2)
+        return posted
+
+    @staticmethod
+    def _to_float(val) -> Optional[float]:
+        try:
+            return float(str(val).replace(",", "")) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _diff_label(mine: float, avg: float) -> str:
+        if not avg or not mine:
+            return ""
+        pct = (mine - avg) / avg * 100
+        if pct >= 5:  return f"🔺 +{pct:.0f}%"
+        if pct <= -5: return f"🔻 {pct:.0f}%"
+        return "✅ Sawa"
+
+    async def _avg_metric(self, field: str, location: str) -> float:
+        rows = await db.execute("crowd_profiles", "select", eq={"location": location})
+        vals = [r[field] for r in rows.data if r.get(field) is not None]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    async def _peer_count(self, location: str) -> int:
+        rows = await db.execute("crowd_profiles", "select", eq={"location": location})
+        return len(rows.data)
+
+    async def _top_challenge(self, location: str) -> str:
+        rows = await db.execute("crowd_profiles", "select", eq={"location": location})
+        challenges = [r["challenge"] for r in rows.data if r.get("challenge")]
+        return Counter(challenges).most_common(1)[0][0] if challenges else "Bei ya juu"
+
+
+advice_engine = SmartAdviceEngine()
 
 # ══════════════════════════════════════════════
 # SUPABASE STORAGE UPLOADER
@@ -1095,6 +1522,11 @@ class WhatsAppBusinessBot:
                 if "pay" in message.lower():
                     return await self._handle_payment(phone, shop)
                 return "Usajili wako umekwisha. Jibu *PAY* kuhuisha."
+                
+            crowd = advice_engine.match_command(message)
+            if crowd:
+                handler_name, raw = crowd
+                return await getattr(advice_engine, handler_name)(phone, raw)
 
             parsed    = await nlp.parse_message(message)
             shop_id   = shop["id"]
@@ -1313,8 +1745,20 @@ class WhatsAppBusinessBot:
                     lines.append(f"  💡 {ins['suggestion']}")
         if not leaks and not insights:
             lines.append("✓ Kila kitu kiko sawa! Hongera! 🎉")
-        return "\n".join(lines)
 
+        # ── enrich with top crowd tips ─────────
+        shop_r    = await db.execute("shops", "select", eq={"id": shop_id})
+        shop_d    = shop_r.data[0] if shop_r.data else {}
+        location  = shop_d.get("location", "unknown")
+        shop_type = shop_d.get("shop_type", "duka")
+        top_tips  = await advice_engine.get_top_tips(location, shop_type)
+        if top_tips:
+            lines.append("\n*🤝 Wafanyabiashara Wenzako Wanasema:*")
+            for tip in top_tips:
+                lines.append(f"• {tip}")
+            lines.append(f"\n_Tuma /tip kushiriki uzoefu wako!_")
+
+        return "\n".join(lines)
     async def _handle_alerts(self, shop_id, entities, message, *_):
         products  = await db.execute("products","select",eq={"shop_id":shop_id})
         low_stock = [p for p in products.data if p["quantity"] < p.get("reorder_level",10)]
@@ -1462,7 +1906,13 @@ async def cron_reminders():
 async def cron_scrape():
     count = await scraper.scrape_data()
     return {"records_scraped": count}
-
+    
+@app.post("/cron/flush-channel", dependencies=[Depends(_cron_auth)])
+async def cron_flush_channel():
+    """Flush pending channel queue — run after CHANNEL_LIVE=true is set."""
+    posted = await advice_engine.flush_channel_queue()
+    return {"posted": posted}
+    
 @app.post("/cron/monthly-report", dependencies=[Depends(_cron_auth)])
 async def cron_monthly_report(background_tasks: BackgroundTasks):
     """Run on the last day of each month via external cron (e.g. cron-job.org)."""
