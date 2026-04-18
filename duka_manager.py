@@ -399,7 +399,7 @@ class BusinessAnalytics:
                                for d, v in zip(future, preds)],
             "total_forecast": round(float(sum(preds)), 2),
             "trend":          round(float(model.coef_[0]), 2),
-      )
+      }
 
 # MARKET DATA SCRAPER
 # ══════════════════════════════════════════════
