@@ -25,9 +25,6 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Depends, F
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from supabase import create_client, Client
-from twilio.rest import Client as TwilioClient
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.request_validator import RequestValidator
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 from duka_manager import app
