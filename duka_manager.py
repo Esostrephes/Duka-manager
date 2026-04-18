@@ -41,7 +41,7 @@ class Config:
     supabase_key:          str = os.getenv("SUPABASE_KEY", "")
     story_score_threshold:    float = float(os.getenv("STORY_SCORE_THRESHOLD", "7.0"))
     channel_link:     str = os.getenv("CHANNEL_LINK", "")
-    channel_live: bool = os.getenv("CHANNEL_LIVE", "false").lower==true
+    channel_live: bool = os.getenv("CHANNEL_LIVE", "false").lower()==True
     openai_api_key:        str = os.getenv("OPENAI_API_KEY", "")
     mpesa_consumer_key:    str = os.getenv("MPESA_CONSUMER_KEY", "")
     mpesa_consumer_secret: str = os.getenv("MPESA_CONSUMER_SECRET", "")
