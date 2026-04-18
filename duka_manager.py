@@ -1,22 +1,7 @@
-"""
-duka_manager.py
-===============
-Single-file WhatsApp Business Manager for Kenyan dukas.
 
-Includes:
-  • NLP engine (pattern match + GPT-4o-mini fallback, async-native)
-  • Full bot handlers: inventory, sales, debts, expenses, alerts
-  • BusinessAnalytics: metrics, leaks, insights, forecast, market comparison
-  • ReminderSystem: tiered WhatsApp debt reminders
-  • MarketDataScraper: KAMIS / Cheki / generic
-  • MpesaService: STK Push + callback
-  • BalanceBookReporter: monthly PNG (table + chart) → Supabase Storage → WhatsApp MMS
-  • On-demand daily snapshot (text) whenever trader asks
-  • FastAPI: webhook (Twilio-validated), M-Pesa callback, protected cron endpoints
-"""
 
 import os, re, json, asyncio, logging, base64, io, uuid, textwrap, hashlib
-from collections import defaultdict, counter 
+from collections import defaultdict, Counter 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional
