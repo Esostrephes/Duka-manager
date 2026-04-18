@@ -45,6 +45,7 @@ from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+from duka-manager import app
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
