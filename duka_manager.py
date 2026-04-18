@@ -27,7 +27,6 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-from duka_manager import app
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
