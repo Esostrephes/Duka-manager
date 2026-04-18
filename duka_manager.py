@@ -399,82 +399,8 @@ class BusinessAnalytics:
                                for d, v in zip(future, preds)],
             "total_forecast": round(float(sum(preds)), 2),
             "trend":          round(float(model.coef_[0]), 2),
-        }
+      )
 
-# ══════════════════════════════════════════════
-# REMINDER SYSTEM
-# ══════════════════════════════════════════════
-class ReminderSystem:
-    def __init__(self):
-        self.twilio = TwilioClient(config.twilio_account_sid, config.twilio_auth_token)
-
-    async def send_reminder(self, debt: Dict, attempt: int) -> bool:
-        phone = (debt.get("customer_phone") or "").strip()
-        if not phone:
-            log.warning(f"No phone for {debt.get('customer_name')} — skipping reminder")
-            return False
-
-        days_old = (datetime.now() - dateparser.parse(debt["created_at"])).days
-        name     = debt["customer_name"]
-        amount   = debt["amount"]
-
-        if days_old <= 7:
-            body = (f"*Ukumbusho* 🏪\nHabari {name}, una deni la *KES {amount:,.0f}* "
-                    f"kutoka dukani. Tafadhali lipa ukipata nafasi. Asante! 🙏")
-        elif days_old <= 30:
-            body = (f"*Ukumbusho wa Malipo* ⏰\nHujambo {name}, deni lako la "
-                    f"*KES {amount:,.0f}* lina siku {days_old} sasa. "
-                    f"Tafadhali lipa ili tushirikiane vizuri. 🤝")
-        else:
-            body = (f"*Malipo Yaliyochelewa* ⚠️\nNdugu {name}, deni lako la "
-                    f"*KES {amount:,.0f}* lina siku {days_old} na imechelewa. "
-                    f"Wasiliana nasi haraka ili tupange malipo.")
-
-        if days_old > 60 and attempt == 1:
-            body += "\n\n*Kumbuka:* Lipa ndani ya siku 3 upate punguzo la 10%."
-
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: self.twilio.messages.create(
-                    body=body, from_=config.twilio_whatsapp_number,
-                    to=f"whatsapp:{phone}"
-                )
-            )
-            if debt.get("id"):
-                await db.execute("debts", "update",
-                    data={"reminder_count": debt.get("reminder_count", 0) + 1,
-                          "last_reminder": datetime.now().isoformat()},
-                    match={"key": "id", "value": debt["id"]})
-            return True
-        except Exception as e:
-            log.error(f"Reminder send failed: {e}")
-            return False
-
-    async def follow_up_debts(self) -> int:
-        debts = await db.execute("debts", "select", eq={"status": "pending"})
-        sent  = 0
-        schedule = [(3,0),(7,1),(14,2),(30,3)]
-        for debt in debts.data:
-            rc = debt.get("reminder_count", 0)
-            if rc >= 5:
-                continue
-            age = (datetime.now() - dateparser.parse(debt["created_at"])).days
-            for trigger_day, trigger_count in schedule:
-                if age == trigger_day and rc == trigger_count:
-                    if await self.send_reminder(debt, rc + 1):
-                        sent += 1
-                    break
-            else:
-                if age > 45 and rc == 4:
-                    if await self.send_reminder(debt, 5):
-                        sent += 1
-        return sent
-
-reminder_system = ReminderSystem()
-
-# ══════════════════════════════════════════════
 # MARKET DATA SCRAPER
 # ══════════════════════════════════════════════
 class MarketDataScraper:
